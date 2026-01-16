@@ -1,21 +1,17 @@
-
 import os
 import time
 import numpy as np
 import base64
 import streamlit as st
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration, WebRtcMode
+import cv2
 
-# Try to import dlib and dependencies - may not be available on cloud
+# Try to import MediaPipe for face detection
 try:
-    import dlib
-    import cv2
-    from imutils import face_utils
-    from scipy.spatial import distance
-    DLIB_AVAILABLE = True
+    import mediapipe as mp
+    MEDIAPIPE_AVAILABLE = True
 except ImportError:
-    DLIB_AVAILABLE = False
-    import cv2
+    MEDIAPIPE_AVAILABLE = False
 
 # =============================================================================
 # CONFIGURATION
@@ -35,7 +31,7 @@ def load_css(file_name):
 try:
     load_css("assets/style.css")
 except FileNotFoundError:
-    st.warning("CSS file not found. Please ensure assets/style.css exists.")
+    pass
 
 # Load Audio
 @st.cache_data
@@ -49,47 +45,25 @@ def load_alert_sound():
 
 alert_sound_b64 = load_alert_sound()
 
-# Constants
-MODEL_PATH = "models/shape_predictor_68_face_landmarks.dat"
-
-# Auto-download model if not present (for cloud deployment)
-@st.cache_resource
-def ensure_model_exists():
-    """Download facial landmark model if not present"""
-    import urllib.request
-    
-    if not DLIB_AVAILABLE:
-        return None
-        
-    if not os.path.exists(MODEL_PATH):
-        os.makedirs("models", exist_ok=True)
-        
-        with st.spinner("📥 Downloading facial landmark model (one-time, ~95MB)..."):
-            try:
-                url = "https://github.com/italojs/facial-landmarks-recognition/raw/master/shape_predictor_68_face_landmarks.dat"
-                urllib.request.urlretrieve(url, MODEL_PATH)
-                st.success("✅ Model downloaded successfully!")
-            except Exception as e:
-                st.error(f"❌ Failed to download model: {e}")
-                st.info("💡 Please manually download shape_predictor_68_face_landmarks.dat and place in models/ folder")
-                return None
-    return MODEL_PATH
-
-# Ensure model exists before proceeding
-if DLIB_AVAILABLE:
-    ensure_model_exists()
+# MediaPipe face mesh indices for eyes
+# Left eye indices (from MediaPipe face mesh)
+LEFT_EYE = [362, 385, 387, 263, 373, 380]
+# Right eye indices
+RIGHT_EYE = [33, 160, 158, 133, 153, 144]
 
 # =============================================================================
 # CORE LOGIC
 # =============================================================================
 
-def calculate_ear(eye):
-    if not DLIB_AVAILABLE:
-        return 0.3
-    A = distance.euclidean(eye[1], eye[5])
-    B = distance.euclidean(eye[2], eye[4])
-    C = distance.euclidean(eye[0], eye[3])
-    ear = (A + B) / (2.0 * C)
+def calculate_ear(eye_points):
+    """Calculate Eye Aspect Ratio using 6 eye landmark points"""
+    # Vertical distances
+    A = np.linalg.norm(eye_points[1] - eye_points[5])
+    B = np.linalg.norm(eye_points[2] - eye_points[4])
+    # Horizontal distance
+    C = np.linalg.norm(eye_points[0] - eye_points[3])
+    # EAR formula
+    ear = (A + B) / (2.0 * C) if C > 0 else 0
     return ear
 
 class DrowsinessProcessor(VideoProcessorBase):
@@ -99,68 +73,76 @@ class DrowsinessProcessor(VideoProcessorBase):
         self.ear_value = 0.0
         self.ear_threshold = 0.25
         self.frame_check = 20
-        
-        if DLIB_AVAILABLE:
-            try:
-                self.detector = dlib.get_frontal_face_detector()
-                if os.path.exists(MODEL_PATH):
-                    self.predictor = dlib.shape_predictor(MODEL_PATH)
-                else:
-                    self.predictor = None
-                self.lStart, self.lEnd = face_utils.FACIAL_LANDMARKS_68_IDXS["left_eye"]
-                self.rStart, self.rEnd = face_utils.FACIAL_LANDMARKS_68_IDXS["right_eye"]
-            except Exception:
-                self.predictor = None
+
+        if MEDIAPIPE_AVAILABLE:
+            self.mp_face_mesh = mp.solutions.face_mesh
+            self.face_mesh = self.mp_face_mesh.FaceMesh(
+                max_num_faces=1,
+                refine_landmarks=True,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5
+            )
         else:
-            self.predictor = None
-            
+            self.face_mesh = None
+
     def update_settings(self, threshold, frames):
         self.ear_threshold = threshold
         self.frame_check = frames
 
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
-        
-        # If dlib not available, just return the frame with a message
-        if not DLIB_AVAILABLE or self.predictor is None:
-            cv2.putText(img, "Face detection unavailable (dlib not installed)", (10, 30),
+
+        if not MEDIAPIPE_AVAILABLE or self.face_mesh is None:
+            cv2.putText(img, "Face detection unavailable", (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
-            cv2.putText(img, "Running in demo mode - UI functional", (10, 60),
+            cv2.putText(img, "Running in demo mode", (10, 60),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
             return frame.from_ndarray(img, format="bgr24")
 
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        rects = self.detector(gray, 0)
-        
+        # Convert to RGB for MediaPipe
+        rgb_frame = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        results = self.face_mesh.process(rgb_frame)
+
         current_alert = False
-        
-        for rect in rects:
-            shape = self.predictor(gray, rect)
-            shape = face_utils.shape_to_np(shape)
+        h, w = img.shape[:2]
 
-            leftEye = shape[self.lStart:self.lEnd]
-            rightEye = shape[self.rStart:self.rEnd]
-            leftEAR = calculate_ear(leftEye)
-            rightEAR = calculate_ear(rightEye)
+        if results.multi_face_landmarks:
+            for face_landmarks in results.multi_face_landmarks:
+                # Extract eye landmarks
+                landmarks = face_landmarks.landmark
 
-            ear = (leftEAR + rightEAR) / 2.0
-            self.ear_value = ear
+                # Get left eye points
+                left_eye_points = np.array([
+                    [landmarks[i].x * w, landmarks[i].y * h] for i in LEFT_EYE
+                ])
 
-            # Visuals
-            leftEyeHull = cv2.convexHull(leftEye)
-            rightEyeHull = cv2.convexHull(rightEye)
-            cv2.drawContours(img, [leftEyeHull], -1, (0, 255, 0), 1)
-            cv2.drawContours(img, [rightEyeHull], -1, (0, 255, 0), 1)
+                # Get right eye points
+                right_eye_points = np.array([
+                    [landmarks[i].x * w, landmarks[i].y * h] for i in RIGHT_EYE
+                ])
 
-            if ear < self.ear_threshold:
-                self.frame_count += 1
-                if self.frame_count >= self.frame_check:
-                    current_alert = True
-                    cv2.putText(img, "DROWSINESS ALERT!", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            else:
-                self.frame_count = 0
-        
+                # Calculate EAR for both eyes
+                left_ear = calculate_ear(left_eye_points)
+                right_ear = calculate_ear(right_eye_points)
+                ear = (left_ear + right_ear) / 2.0
+                self.ear_value = ear
+
+                # Draw eye contours
+                left_eye_int = left_eye_points.astype(np.int32)
+                right_eye_int = right_eye_points.astype(np.int32)
+                cv2.polylines(img, [left_eye_int], True, (0, 255, 0), 1)
+                cv2.polylines(img, [right_eye_int], True, (0, 255, 0), 1)
+
+                # Check for drowsiness
+                if ear < self.ear_threshold:
+                    self.frame_count += 1
+                    if self.frame_count >= self.frame_check:
+                        current_alert = True
+                        cv2.putText(img, "DROWSINESS ALERT!", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                else:
+                    self.frame_count = 0
+
         self.alert_status = current_alert
         return frame.from_ndarray(img, format="bgr24")
 
@@ -181,14 +163,12 @@ def render_brand_header():
 
 def main():
     render_brand_header()
-    
-    # Show warning if dlib not available
-    if not DLIB_AVAILABLE:
-        st.warning("⚠️ **Demo Mode**: Face detection libraries (dlib) are not available in this deployment. The UI is fully functional, but drowsiness detection is disabled. For full functionality, run locally or use Docker deployment.")
-    
-    # Layout: Left video (2/3), Right stats (1/3)
+
+    if not MEDIAPIPE_AVAILABLE:
+        st.warning("Face detection libraries are not available. Running in demo mode.")
+
     col_video, col_stats = st.columns([2, 1], gap="medium")
-    
+
     with col_video:
         st.markdown("""
         <div class="video-container">
@@ -198,7 +178,7 @@ def main():
             </div>
         </div>
         """, unsafe_allow_html=True)
-        
+
         ctx = webrtc_streamer(
             key="drowsiness-detection",
             mode=WebRtcMode.SENDRECV,
@@ -211,13 +191,9 @@ def main():
         )
 
     with col_stats:
-        # 1. Status Card (Big)
         status_placeholder = st.empty()
-        
-        # Audio Placeholder (Hidden)
         audio_placeholder = st.empty()
-        
-        # 2. Metrics Row
+
         m_col1, m_col2 = st.columns(2)
         with m_col1:
              ear_placeholder = st.empty()
@@ -236,7 +212,6 @@ def main():
                 </div>
              """, unsafe_allow_html=True)
 
-        # 3. Session Time
         session_placeholder = st.empty()
         session_placeholder.markdown("""
             <div class="metric-box">
@@ -245,15 +220,13 @@ def main():
             </div>
         """, unsafe_allow_html=True)
 
-        # 4. Settings (Expander at bottom)
-        with st.expander("⚙️ Configuration", expanded=True):
+        with st.expander("Configuration", expanded=True):
             threshold = st.slider("EAR Sensitivity", 0.15, 0.35, 0.25, 0.01)
             frames = st.slider("Alert Delay (frames)", 5, 50, 20)
-            
+
             if ctx.video_processor:
                 ctx.video_processor.update_settings(threshold, frames)
 
-        # Logic Loop
         if ctx.state.playing:
             start_time = time.time() if 'start_time' not in st.session_state else st.session_state.start_time
             if 'start_time' not in st.session_state:
@@ -262,7 +235,6 @@ def main():
 
             while ctx.state.playing:
                 if ctx.video_processor:
-                    # Update EAR
                     ear_val = ctx.video_processor.ear_value
                     ear_placeholder.markdown(f"""
                         <div class="metric-box">
@@ -270,8 +242,7 @@ def main():
                             <div class="metric-value">{ear_val:.3f}</div>
                         </div>
                     """, unsafe_allow_html=True)
-                    
-                    # Check Alert Status
+
                     if ctx.video_processor.alert_status:
                         status_placeholder.markdown("""
                             <div class="css-card" style="text-align:center; border-color: #ff4757;">
@@ -280,15 +251,14 @@ def main():
                                 <div style="color:rgba(255,255,255,0.5); font-size:0.9rem; margin-top:0.5rem;">Wake Up!</div>
                             </div>
                         """, unsafe_allow_html=True)
-                        
-                        # Audio
+
                         if alert_sound_b64:
                             unique_id = f"audio_{int(time.time() * 10)}"
                             audio_placeholder.markdown(
                                 f'<div id="{unique_id}"><audio autoplay><source src="data:audio/wav;base64,{alert_sound_b64}"></audio></div>',
                                 unsafe_allow_html=True
                             )
-                        
+
                     else:
                         status_placeholder.markdown("""
                             <div class="css-card" style="text-align:center;">
@@ -299,7 +269,6 @@ def main():
                         """, unsafe_allow_html=True)
                         audio_placeholder.empty()
 
-                    # Update Timer
                     elapsed = int(time.time() - st.session_state.start_time)
                     mins, secs = divmod(elapsed, 60)
                     hrs, mins = divmod(mins, 60)
@@ -312,10 +281,9 @@ def main():
 
                 time.sleep(0.1)
         else:
-            # Standby State
             if 'start_time' in st.session_state:
                 del st.session_state.start_time
-            
+
             status_placeholder.markdown("""
                 <div class="css-card" style="text-align:center;">
                     <div class="status-big-icon" style="opacity:0.5;">📷</div>
